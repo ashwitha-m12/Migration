@@ -1,0 +1,5 @@
+Migration_Backups/
+.env
+.venv/
+profiles/
+__pycache__/
