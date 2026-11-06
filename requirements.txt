@@ -1,6 +1,6 @@
 python-dotenv>=1.0
 keyring>=24      # saves passwords in Windows Credential Manager / macOS Keychain
-streamlit>=1.30
+streamlit>=1.40      # pop-up guide and button icons need 1.40+
 pandas>=2.0
 
 # Snowflake
@@ -10,7 +10,7 @@ snowflake-connector-python>=4.7,<5   # 5.x corrupts some Azure file downloads (d
 azure-storage-blob>=12.19
 azure-identity>=1.15
 azure-mgmt-datafactory>=10.0
-azure-mgmt-resource>=23.0
+azure-mgmt-resource>=23.1,<25   # 25+ was split into separate packages
 
 # Databricks (only needed if you migrate Databricks)
 databricks-sdk>=0.20

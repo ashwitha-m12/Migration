@@ -17,7 +17,7 @@ def _db():
 class FakeConnector(Connector):
     name, env_prefix, title = "demo", "DEMO", "Demo platform (for testing)"
     fields = [Field("ACCOUNT", "Account", required=True), Field("PASSWORD", "Password", secret=True),
-              Field("REGION", "Region", default="central-india", advanced=True)]
+              Field("REGION", "Region", default="eu-west", advanced=True)]
 
     def connect(self):
         if self.env("PASSWORD") == "wrong":
@@ -44,7 +44,13 @@ class FakeConnector(Connector):
         db["TGT"] = json.loads((pkg / "demo" / "data.json").read_text())
         STORE.write_text(json.dumps(db))
         self.log("Restored.")
-        return [Result("database", n, OK, "created") for n in db["TGT"]]
+        return [Result("database", n, OK, "created") for n in db["TGT"]] + [
+            Result("tasks", "2 task chain(s)", MANUAL,
+                   "created switched off on purpose. When you want the pipeline running (uses credits), run:",
+                   "SELECT SYSTEM$TASK_DEPENDENTS_ENABLE('SALES_DB.PUBLIC.LOAD_ORDERS');\n"
+                   "SELECT SYSTEM$TASK_DEPENDENTS_ENABLE('HR_DB.PUBLIC.LOAD_EMP');"),
+            Result("users", "1 user(s)", MANUAL, "created without passwords (no tool can read them). Set one for each user:",
+                   "ALTER USER \"ANALYST\" SET PASSWORD = '<choose a password>' MUST_CHANGE_PASSWORD = TRUE;")]
 
     def validate(self, pkg):
         want = json.loads((pkg / "demo" / "data.json").read_text())

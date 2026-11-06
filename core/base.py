@@ -10,6 +10,10 @@ from pathlib import Path
 OK, FAILED, MANUAL, SKIPPED = "OK", "FAILED", "MANUAL", "SKIPPED"
 
 
+class Friendly(Exception):
+    """An error whose message is already plain language with a fix - shown to the user as is."""
+
+
 @dataclass
 class Resource:
     """Something found in an account (a table, a pipeline, a notebook...)."""
@@ -25,6 +29,7 @@ class Result:
     name: str
     status: str          # OK | FAILED | MANUAL | SKIPPED
     message: str = ""
+    action: str = ""     # exact command(s) for THIS account, shown in a copy box
 
 
 @dataclass
@@ -75,7 +80,10 @@ class Connector(ABC):
     def env(self, key: str, default=None, required: bool = False):
         val = os.getenv(self.var(key), default)
         if required and not val:
-            raise RuntimeError(f"Missing setting {self.var(key)} - add it to your .env file")
+            label = next((f.label for f in self.fields if f.key == key), key)
+            which = "old" if self.side == "SRC" else "new"
+            raise Friendly(f"Please fill in '{label}' for the {which} account (setting {self.var(key)}). "
+                           f"Click 'How do I get these details?' to see where to find it.")
         return val
 
     def env_list(self, key: str) -> list[str]:
@@ -110,3 +118,17 @@ class Connector(ABC):
 
     def close(self) -> None:
         pass
+
+    # ---- help for people using the tool for the first time --------------
+    @classmethod
+    def guide_text(cls) -> str:
+        """Step-by-step 'where do I find these details' guide, from guides/<name>.md."""
+        f = Path(__file__).resolve().parents[1] / "guides" / f"{cls.name}.md"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+    def explain(self, err: Exception) -> str:
+        """Turn a raw error into what it means and what to do. Connectors add their own rules."""
+        if isinstance(err, Friendly):
+            return str(err)
+        lines = [l.strip() for l in str(err).strip().splitlines() if l.strip()]
+        return " ".join(lines[:3])[:400] if lines else type(err).__name__

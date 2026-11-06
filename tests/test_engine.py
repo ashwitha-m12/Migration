@@ -89,19 +89,19 @@ class FakeSnowflake:
     def answer(self, sql):
         s = " ".join(sql.split()).upper()
         if s.startswith("SELECT CURRENT_USER()"):
-            return [("NEWME" if self.target else "AR73M",)]
+            return [("NEWME" if self.target else "OLD_USER",)]
         if s.startswith("SHOW SHARES"):
             return [{"name": "ACCOUNT_USAGE", "database_name": "SNOWFLAKE", "kind": "INBOUND"}]
         if s.startswith("SHOW USERS"):
-            return [{"name": "AR73M"}, {"name": "ANALYST_USER", "email": "a@b.c", "default_role": "ANALYST"}]
+            return [{"name": "OLD_USER"}, {"name": "ANALYST_USER", "email": "a@b.c", "default_role": "ANALYST"}]
         if s.startswith("SHOW GRANTS OF ROLE"):
-            return [{"granted_to": "USER", "grantee_name": "AR73M"}]
+            return [{"granted_to": "USER", "grantee_name": "OLD_USER"}]
         if s.startswith("SHOW TABLES IN ACCOUNT"):
-            return [{"name": "ORDERS", "schema_name": "BRONZE", "database_name": "SUPPLY_CHAIN_DB"}]
+            return [{"name": "ORDERS", "schema_name": "BRONZE", "database_name": "SALES_DB"}]
         if s.startswith("SHOW MASKING POLICIES IN ACCOUNT"):
-            return [{"name": "MASK_EMAIL", "schema_name": "SILVER", "database_name": "SUPPLY_CHAIN_DB"}]
+            return [{"name": "MASK_EMAIL", "schema_name": "SILVER", "database_name": "SALES_DB"}]
         if s.startswith("SHOW NOTEBOOKS IN ACCOUNT"):
-            return [{"name": "EDA", "schema_name": "GOLD", "database_name": "SUPPLY_CHAIN_DB"}]
+            return [{"name": "EDA", "schema_name": "GOLD", "database_name": "SALES_DB"}]
         if s.startswith("DESC NOTEBOOK"):
             return [{"main_file": "notebook_app.ipynb", "query_warehouse": "COMPUTE_WH"}]
         if s.startswith("LIST 'SNOW://NOTEBOOK"):
@@ -112,9 +112,9 @@ class FakeSnowflake:
             (Path(m.group(1)) / "notebook_app.ipynb").write_text("{}")
             return []
         if s.startswith("SELECT GET_DDL('POLICY'"):
-            return [("create or replace masking policy SUPPLY_CHAIN_DB.SILVER.MASK_EMAIL as (v string) returns string -> v;",)]
+            return [("create or replace masking policy SALES_DB.SILVER.MASK_EMAIL as (v string) returns string -> v;",)]
         if s.startswith("SHOW DATABASES"):
-            return [{"name": "SUPPLY_CHAIN_DB", "origin": "", "kind": "STANDARD"},
+            return [{"name": "SALES_DB", "origin": "", "kind": "STANDARD"},
                     {"name": "SNOWFLAKE", "origin": "", "kind": "STANDARD"}]
         if s.startswith("SHOW SCHEMAS"):
             return [{"name": n} for n in ("BRONZE", "SILVER", "GOLD", "INFORMATION_SCHEMA")]
@@ -131,9 +131,14 @@ class FakeSnowflake:
         if s.startswith("SHOW ROLES"):
             return [{"name": "ACCOUNTADMIN"}, {"name": "ANALYST"}]
         if s.startswith("SHOW GRANTS TO ROLE"):
-            return [{"privilege": "USAGE", "granted_on": "DATABASE", "name": "SUPPLY_CHAIN_DB"}]
+            return [{"privilege": "USAGE", "granted_on": "DATABASE", "name": "SALES_DB"}]
         if s.startswith("SHOW INTEGRATIONS"):
             return [{"name": "AZ_INT", "type": "EXTERNAL_STAGE"}]
+        if s.startswith("DESC INTEGRATION") and self.target:
+            return [{"property": "STORAGE_PROVIDER", "property_value": "AZURE"},
+                    {"property": "AZURE_CONSENT_URL", "property_value": "https://login.microsoftonline.com/x/consent"},
+                    {"property": "AZURE_MULTI_TENANT_APP_NAME", "property_value": "abcsnowflakepacint_1234"},
+                    {"property": "STORAGE_ALLOWED_LOCATIONS", "property_value": "azure://newacct.blob.core.windows.net/raw/"}]
         if s.startswith("DESC INTEGRATION"):
             return [{"property": "STORAGE_PROVIDER", "property_value": "AZURE"},
                     {"property": "AZURE_TENANT_ID", "property_value": "old-tenant"},
@@ -146,13 +151,13 @@ class FakeSnowflake:
         if s.startswith("SHOW STREAMS"):
             return [{"name": "ORDERS_STRM", "schema_name": "BRONZE"}]
         if s.startswith("SELECT GET_DDL('STREAM'"):
-            return [("create or replace stream SUPPLY_CHAIN_DB.BRONZE.ORDERS_STRM on table SUPPLY_CHAIN_DB.BRONZE.ORDERS;",)]
+            return [("create or replace stream SALES_DB.BRONZE.ORDERS_STRM on table SALES_DB.BRONZE.ORDERS;",)]
         if self.target and s.startswith("GRANT USAGE ON DATABASE"):
             raise Exception("001003 (42000): SQL compilation error:\nsyntax error line 1 at position 6 unexpected 'USAGE'.")
         if s.startswith("SHOW GRANTS OF ROLE"):
-            return [{"granted_to": "USER", "grantee_name": "AR73M"}, {"granted_to": "ROLE", "grantee_name": "ACCOUNTADMIN"}]
+            return [{"granted_to": "USER", "grantee_name": "OLD_USER"}, {"granted_to": "ROLE", "grantee_name": "ACCOUNTADMIN"}]
         if s.startswith("SHOW WORKSPACES"):
-            return [{"name": "My Workspace", "database_name": "USER$AR73M", "schema_name": "PUBLIC"}]
+            return [{"name": "My Workspace", "database_name": "USER$OLD_USER", "schema_name": "PUBLIC"}]
         if s.startswith("LIST 'SNOW://WORKSPACE"):
             return [{"name": "versions/live/01_setup.sql"}, {"name": "versions/live/gold/05_gold.sql"},
                     {"name": "versions/live/Snowflake_micro_practice/Fundamentals & Architecture/2.Data  Warehouse/02_DW.sql"},
@@ -177,12 +182,12 @@ class FakeSnowflake:
             (Path(m.group(1)) / name).write_text("select 1;")
             return []
         if "ACCOUNT_USAGE.QUERY_HISTORY" in s:
-            return [{"START_TIME": "2026-10-01", "DATABASE_NAME": "SUPPLY_CHAIN_DB", "SCHEMA_NAME": "BRONZE",
+            return [{"START_TIME": "2026-10-01", "DATABASE_NAME": "SALES_DB", "SCHEMA_NAME": "BRONZE",
                      "QUERY_TYPE": "CREATE_TABLE", "QUERY_TEXT": "create table x(a int)"}]
         if s.startswith("SELECT GET_DDL"):
-            return [("create or replace database SUPPLY_CHAIN_DB;\ncreate or replace schema SUPPLY_CHAIN_DB.BRONZE;\n"
-                     "create or replace view SUPPLY_CHAIN_DB.GOLD.V as select * from SUPPLY_CHAIN_DB.BRONZE.ORDERS;\n"
-                     "create or replace TABLE SUPPLY_CHAIN_DB.BRONZE.ORDERS (ID NUMBER);",)]
+            return [("create or replace database SALES_DB;\ncreate or replace schema SALES_DB.BRONZE;\n"
+                     "create or replace view SALES_DB.GOLD.V as select * from SALES_DB.BRONZE.ORDERS;\n"
+                     "create or replace TABLE SALES_DB.BRONZE.ORDERS (ID NUMBER);",)]
         if s.startswith("SELECT COUNT(*), HASH_AGG(*)"):
             return [(3, 987654321)]
         if s.startswith("GET "):
@@ -191,7 +196,7 @@ class FakeSnowflake:
             d.mkdir(parents=True, exist_ok=True)
             (d / "data_0_0_0.snappy.parquet").write_bytes(b"PAR1")
             return []
-        if self.target and "CREATE OR REPLACE VIEW" in s and not any("TABLE SUPPLY_CHAIN_DB.BRONZE.ORDERS" in x.upper() for x in self.log[:-1]):
+        if self.target and "CREATE OR REPLACE VIEW" in s and not any("TABLE SALES_DB.BRONZE.ORDERS" in x.upper() for x in self.log[:-1]):
             raise Exception("Object 'ORDERS' does not exist")     # dependency not created yet -> must be retried
         return []
 
@@ -213,7 +218,7 @@ def test_snowflake_backup_and_restore(tmp_path, monkeypatch):
     pkg = tmp_path / "pkg"
     res = src.backup(pkg)
     assert not [r for r in res if r.status == "FAILED"], res
-    assert (pkg / "snowflake/databases/SUPPLY_CHAIN_DB.sql").exists()
+    assert (pkg / "snowflake/databases/SALES_DB.sql").exists()
     assert list((pkg / "snowflake/data").rglob("*.parquet"))
     assert (pkg / "snowflake/workspaces/My_Workspace/gold/05_gold.sql").exists()
     assert list((pkg / "snowflake/workspaces").rglob("02_DW.sql"))
@@ -233,8 +238,10 @@ def test_snowflake_backup_and_restore(tmp_path, monkeypatch):
     assert "new-tenant" in log and "newacct.blob" in log and "oldacct" not in log
     assert "COPY INTO" in log and "MATCH_BY_COLUMN_NAME" in log
     assert "versions/live/gold/" in log
+    integ = [r for r in res if r.kind == "integration"][0].message
+    assert "https://login.microsoftonline.com/x/consent" in integ and "abcsnowflakepacint" in integ and "newacct" in integ
     assert 'SET "RAW_ROW" = PARSE_JSON("RAW_ROW"::STRING)' in log          # JSON column turned back into JSON
-    load_at = log.index("COPY INTO \"SUPPLY_CHAIN_DB\"")
+    load_at = log.index("COPY INTO \"SALES_DB\"")
     assert log.lower().index("create or replace stream") > load_at        # streams created only AFTER data load
     assert (pkg / "snowflake/streams.json").exists()
     g = [r for r in res if r.kind == "grant"]
@@ -249,3 +256,18 @@ def test_snowflake_backup_and_restore(tmp_path, monkeypatch):
     assert any(r.kind == "table" and r.status == "OK" and "hash" in r.message for r in v)
     removes = [x for x in src.conn.log if x.upper().startswith("REMOVE")]
     assert removes and all("_migration_" in x for x in removes)      # never touches other @~ files
+
+
+def test_identity_counters_continue():
+    from connectors.snowflake_connector import continue_identity
+    m = {"DB.S.T": [{"table": "DB.S.T", "column": "ID", "next": 215}],
+         "DB.S.LOG": [{"table": "DB.S.LOG", "column": "RUN_ID", "next": 9}],
+         "DB.S.X": [{"table": "DB.S.X", "column": "ID", "next": 5}]}
+    done = []
+    a = continue_identity("create or replace TABLE DB.S.T (\n ID NUMBER(38,0) NOT NULL autoincrement start 1 increment 1 noorder,\n N VARCHAR);", m, done)
+    b = continue_identity('create or replace TABLE "DB"."S"."LOG" ( "RUN_ID" NUMBER(38,0) identity(1,1), X INT);', m, done)
+    c = continue_identity("create or replace TABLE DB.S.X (OTHER_ID NUMBER(38,0) autoincrement start 1 increment 1, ID INT);", m, done)
+    assert "autoincrement start 215" in a
+    assert "identity(9,1)" in b
+    assert "OTHER_ID NUMBER(38,0) autoincrement start 1" in c      # a different column is never touched
+    assert continue_identity("create or replace view DB.S.T as select 1;", m, done).endswith("select 1;")

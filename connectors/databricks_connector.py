@@ -58,6 +58,18 @@ class DatabricksConnector(Connector):
         self.me = self.w.current_user.me().user_name
         self.root = (self.env("ROOT") or f"/Users/{self.me}").rstrip("/")
 
+    def explain(self, err: Exception) -> str:
+        low = str(err).lower()
+        which = "old" if self.side == "SRC" else "new"
+        if "401" in low or "invalid access token" in low or "unauthorized" in low:
+            return (f"The {which} workspace rejected the access token. Create a new one: your name (top right) > Settings > "
+                    "Developer > Access tokens > Generate new token, and paste it.")
+        if "403" in low or "permission_denied" in low:
+            return f"The token's user lacks permission in the {which} workspace. Use a workspace admin's token."
+        if "resolve" in low or "name or service not known" in low or "getaddrinfo" in low:
+            return f"Can't reach the {which} workspace. Check the Workspace URL (https://adb-....azuredatabricks.net)."
+        return super().explain(err)
+
     def _objects(self):
         return list(self.w.workspace.list(self.root, recursive=True))
 
@@ -72,10 +84,11 @@ class DatabricksConnector(Connector):
     def backup(self, pkg: Path) -> list[Result]:
         from databricks.sdk.service.workspace import ExportFormat
         base, R, index = pkg / "databricks", [], []
+        repo_paths = []
         for o in self._objects():
             t = o.object_type.value
             if t == "REPO":
-                R.append(Result("git_folder", o.path, MANUAL, "Git folder - just re-clone it in the new workspace"))
+                repo_paths.append(o.path)
                 continue
             if t not in ("NOTEBOOK", "FILE"):
                 continue
@@ -120,13 +133,35 @@ class DatabricksConnector(Connector):
                     "cluster_name", "spark_version", "node_type_id", "num_workers", "autoscale",
                     "autotermination_minutes", "spark_conf", "spark_env_vars", "data_security_mode", "single_user_name")}
                 (base / "clusters" / f"{safe_name(c.cluster_name or c.cluster_id)}.json").write_text(json.dumps(keep, indent=2))
-                R.append(Result("cluster", c.cluster_name, MANUAL, "config saved - create it by hand (avoids surprise compute cost)"))
+                R.append(Result("cluster", c.cluster_name, OK, "settings saved - restore gives the create command"))
+
+        # Git folders, secret scopes: saved so restore can give exact commands
+        repos = []
+        try:
+            for r in self.w.repos.list():
+                rp = r.path or ""
+                if rp in repo_paths or rp.startswith(self.root + "/") or \
+                        rp.startswith(self.root.replace("/Users/", "/Repos/", 1) + "/"):   # Git folders live in either place
+                    repos.append({"path": r.path, "url": r.url, "branch": r.branch})
+        except Exception:
+            repos = [{"path": pth, "url": "", "branch": ""} for pth in repo_paths]
+        scopes = []
+        try:
+            for sc in self.w.secrets.list_scopes():
+                keys = [k.key for k in self.w.secrets.list_secrets(sc.name)]
+                scopes.append({"scope": sc.name, "keys": keys})
+        except Exception:
+            pass
+        (base / "followups.json").write_text(json.dumps({"repos": repos, "secret_scopes": scopes}, indent=2))
+        if repos:
+            R.append(Result("git_folders", f"{len(repos)} Git folder(s)", OK, "saved - restore gives the re-clone commands"))
+        if scopes:
+            R.append(Result("secrets", f"{len(scopes)} secret scope(s)", OK, "names saved (values can't be read) - restore gives the commands"))
 
         R.append(Result("tables", "Delta / Unity Catalog data", MANUAL,
                         "Table data isn't copied by this version. Before the trial ends, write important tables to "
                         "your own storage (e.g. df.write.format('delta').save('abfss://...')) or back them up "
                         "through Snowflake/Azure."))
-        R.append(Result("secrets", "secret scopes", MANUAL, "Secret values can't be read back - recreate scopes and secrets."))
         return R
 
     # ----------------------------------------------------------------- restore
@@ -169,11 +204,35 @@ class DatabricksConnector(Connector):
             try:
                 resp = self.w.api_client.do("POST", "/api/2.1/jobs/create", body=settings)
                 if paused:
-                    R.append(Result("job", name, MANUAL, f"created (id {resp.get('job_id')}), schedule PAUSED - unpause when ready"))
+                    R.append(Result("job", name, MANUAL,
+                                    f"created (id {resp.get('job_id')}) with its schedule PAUSED. To start it: "
+                                    f"Workflows > {name} > Schedules & triggers > Unpause."))
                 else:
                     R.append(Result("job", name, OK, f"created (id {resp.get('job_id')})"))
             except Exception as e:
                 R.append(Result("job", name, FAILED, _err(e)))
+
+        # follow-ups with exact commands
+        fu = json.loads((base / "followups.json").read_text()) if (base / "followups.json").exists() else {}
+        for repo in fu.get("repos", []):
+            path = repo["path"].replace(old_root, self.root)
+            if old_root.startswith("/Users/"):
+                path = path.replace(old_root.replace("/Users/", "/Repos/"), self.root.replace("/Users/", "/Repos/"))
+            R.append(Result("git_folder", path, MANUAL,
+                            "Git folder - re-clone it (Databricks CLI):",
+                            f"databricks repos create {repo['url'] or '<repo url>'} --path {path}"
+                            + (f"\ndatabricks repos update {path} --branch {repo['branch']}" if repo.get("branch") else "")))
+        if fu.get("secret_scopes"):
+            lines = []
+            for sc in fu["secret_scopes"]:
+                lines.append(f"databricks secrets create-scope {sc['scope']}")
+                lines += [f"databricks secrets put-secret {sc['scope']} {k}" for k in sc["keys"]]
+            R.append(Result("secrets", f"{len(fu['secret_scopes'])} secret scope(s)", MANUAL,
+                            "values can't be copied. Create the scopes and type each value when asked:", "\n".join(lines)))
+        for cf in sorted((base / "clusters").glob("*.json")) if (base / "clusters").exists() else []:
+            R.append(Result("cluster", cf.stem, MANUAL,
+                            "not created automatically (it would start costing money). When you need it:",
+                            f"databricks clusters create --json @\"{cf.resolve()}\""))
 
         for f in sorted((base / "pipelines").glob("*.json")):
             spec = json.loads(self.apply_rewrites(f.read_text().replace(old_root, self.root)))

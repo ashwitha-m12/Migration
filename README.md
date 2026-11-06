@@ -18,6 +18,15 @@ Works today for **Snowflake**, **Azure** (Storage + Data Factory) and **Databric
 
 Mac / Linux: run `bash start.sh` instead.
 
+## First time with a platform?
+
+On the **Accounts** page, click **How do I get these details?**. A pop-up shows, step by step:
+- where to find every value
+- what you must create first (for Azure: an **app registration**, its **client secret**, and the **role** it needs)
+- fixes for the most common errors
+
+The same guides are in the `guides` folder.
+
 ## Using the app
 
 | Step | What you do |

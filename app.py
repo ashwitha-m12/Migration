@@ -63,9 +63,24 @@ def results_table(results):
     if df.empty:
         st.info("Nothing to show.")
         return
+    df = df.drop(columns=["action"], errors="ignore")      # commands are shown in the to-do list above
     df = df.rename(columns={"status": "Status", "kind": "Type", "name": "Name", "message": "Details"})
     st.dataframe(df.style.map(lambda v: f"background-color:{STATUS_COLORS.get(v, '')}", subset=["Status"]),
                  use_container_width=True, hide_index=True)
+
+
+def todo_list(results, title="Things you still need to do"):
+    """Manual items (and failures that come with a fix), each with its exact command in a copy box."""
+    items = [r for r in results if r.status == "MANUAL" or (r.status == "FAILED" and r.action)]
+    if not items:
+        return
+    st.subheader(title)
+    for r in items:
+        icon = ":red[●]" if r.status == "FAILED" else ":orange[●]"
+        st.markdown(f"{icon} **{r.name}** - {r.message}")
+        if r.action:
+            lang = "bash" if r.action.lstrip().startswith(("az ", "databricks ", "#")) else "sql"
+            st.code(r.action, language=lang)
 
 
 def summary(counts):
@@ -98,16 +113,25 @@ def package_picker(platform, key):
     return Path(choice)
 
 
-def open_folder(path: Path):
+def open_folder(path: Path) -> bool:
+    """Open the folder in the computer's file manager (Explorer on Windows)."""
+    target = str(path.resolve())
     try:
         if _os.system() == "Windows":
-            os.startfile(path.resolve())                       # noqa: S606
+            subprocess.Popen(["explorer", target])              # works even when os.startfile is blocked
         elif _os.system() == "Darwin":
-            subprocess.Popen(["open", str(path.resolve())])
+            subprocess.Popen(["open", target])
         else:
-            subprocess.Popen(["xdg-open", str(path.resolve())])
+            subprocess.Popen(["xdg-open", target])
+        return True
     except Exception as e:
-        st.warning(f"Couldn't open the folder: {e}")
+        st.warning(f"Couldn't open the folder automatically ({e}). Copy the path below into File Explorer.")
+        return False
+
+
+@st.dialog("How to get these details", width="large")
+def show_guide(text: str):
+    st.markdown(text)
 
 
 # ----------------------------------------------------------------------------- sidebar
@@ -130,6 +154,13 @@ with st.sidebar:
 if page == "1. Accounts":
     st.header("1. Accounts")
     st.write("Enter the login details for the old and the new account. You can save them as a profile for next time.")
+    guide = cls.guide_text()
+    if guide:
+        g1, g2 = st.columns([1, 3])
+        if g1.button("How do I get these details?", icon=":material/help:", type="secondary"):
+            show_guide(guide)
+        g2.caption("First time? It shows where to find every value, what to create first, "
+                   "which permissions are needed, and fixes for common errors.")
 
     if "profile_msg" in st.session_state:
         st.success(st.session_state.pop("profile_msg"))
@@ -246,6 +277,7 @@ elif page == "2. Back up":
             pkg, results, counts = out
             st.success(f"Backup saved: {pkg.name}")
             summary(counts)
+            todo_list(results, "Before you continue")
             results_table(results)
 
 
@@ -270,11 +302,7 @@ elif page == "3. Restore":
                 _, results, counts = out
                 st.success("Restore finished. Next: open **4. Check**.")
                 summary(counts)
-                manual = [r for r in results if r.status == "MANUAL"]
-                if manual:
-                    st.subheader("Things you still need to do")
-                    for r in manual:
-                        st.markdown(f"- **{r.name}** - {r.message}")
+                todo_list(results)
                 results_table(results)
 
 
@@ -293,6 +321,7 @@ elif page == "4. Check":
             else:
                 st.error(f"{counts['FAILED']} difference(s) found - see the red rows.")
             summary(counts)
+            todo_list(results, "What to look at")
             results_table(results)
 
 
@@ -301,10 +330,20 @@ else:
     st.header("Backups & reports")
     pkg = package_picker(platform, "report_pkg")
     if pkg:
-        if st.button("Open backup folder"):
-            open_folder(pkg)
+        c1, c2 = st.columns([1, 3])
+        if c1.button("Open backup folder", icon=":material/folder_open:"):
+            if open_folder(pkg):
+                st.toast("Opened in File Explorer - check your taskbar if it's behind this window.")
+        c2.caption("The backup folder on this computer (you can also paste this into File Explorer):")
+        c2.code(str(pkg.resolve()), language=None)
         tabs = [t for t in ("backup", "restore", "validate") if (pkg / f"report_{t}.md").exists()]
         if tabs:
-            for tab, name in zip(st.tabs([t.title() for t in tabs]), tabs):
+            for tab, name in zip(st.tabs([{"validate": "Check"}.get(t, t.title()) for t in tabs]), tabs):
                 with tab:
-                    st.markdown((pkg / f"report_{name}.md").read_text(encoding="utf-8"))
+                    md = (pkg / f"report_{name}.md").read_text(encoding="utf-8")
+                    st.download_button("Download this report", md.encode("utf-8"),
+                                       file_name=f"{pkg.name}_report_{name}.md", mime="text/markdown",
+                                       icon=":material/download:", key=f"dl_{name}")
+                    st.markdown(md)
+        else:
+            st.info("No reports in this backup yet.")

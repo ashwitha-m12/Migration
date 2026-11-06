@@ -38,7 +38,12 @@ def write_report(pkg: Path, op: str, platform: str, results: list[Result]) -> di
     for title, status in (("Failed", FAILED), ("Needs manual action", MANUAL)):
         items = [r for r in results if r.status == status]
         if items:
-            lines += [f"## {title}", ""] + [f"- `{r.kind}` **{r.name}** - {r.message}" for r in items] + [""]
+            lines += [f"## {title}", ""]
+            for r in items:
+                lines.append(f"- `{r.kind}` **{r.name}** - {r.message}")
+                if r.action:
+                    lines += ["", "  ```", *[f"  {a}" for a in r.action.splitlines()], "  ```", ""]
+            lines.append("")
     lines += ["## All items", "", "| Status | Kind | Name | Message |", "|---|---|---|---|"]
     lines += [f"| {r.status} | {r.kind} | {r.name} | {r.message.replace('|', '/')} |" for r in results]
     (pkg / f"report_{op}.md").write_text("\n".join(lines), encoding="utf-8")
@@ -54,16 +59,18 @@ def _open(platform: str, side: str, log=None):
 
 
 def test_connection(platform: str, side: str) -> tuple[bool, str]:
-    """Used by the app's 'Test connection' button."""
+    """Used by the app's 'Test connection' button. Errors come back in plain language with a fix."""
+    c = load(platform)(side)
     try:
-        c = _open(platform, side)
+        c.connect()
         try:
             n = len(c.discover())
+            note = c.preflight() if hasattr(c, "preflight") else ""
         finally:
             c.close()
-        return True, f"Connected - {n} resources visible"
+        return True, f"Connected - {n} resources visible" + (f". {note}" if note else "")
     except Exception as e:
-        return False, (str(e).strip().splitlines() or [type(e).__name__])[0][:300]
+        return False, c.explain(e)
 
 
 def discover(platform: str, side: str = "SRC"):

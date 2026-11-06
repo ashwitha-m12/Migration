@@ -50,6 +50,30 @@ def file_url(path: Path) -> str:
     return "file://" + str(path.resolve()).replace("\\", "/")
 
 
+_TABLE_RE = re.compile(r'(?is)^create\s+(?:or\s+replace\s+)?(?:(?:local|global)\s+)?(?:transient\s+|temporary\s+)?table\s+([^\s(]+)')
+
+
+def continue_identity(stmt: str, id_map: dict, done: list) -> str:
+    """In a CREATE TABLE statement, set each identity column's START to the value after the old highest ID."""
+    m = _TABLE_RE.match(stmt)
+    if not m:
+        return stmt
+    items = id_map.get(m.group(1).replace('"', "").upper())
+    if not items:
+        return stmt
+    for it in items:
+        col = re.escape(it["column"])
+        pats = [rf'((?:^|[\s(,])"?{col}"?\s(?:\([^)]*\)|[^,(])*?\b(?:autoincrement|identity)\s+start\s+)(-?\d+)',
+                rf'((?:^|[\s(,])"?{col}"?\s(?:\([^)]*\)|[^,(])*?\b(?:autoincrement|identity)\s*\(\s*)(-?\d+)']
+        for pat in pats:
+            new, n = re.subn(pat, lambda mm: mm.group(1) + str(it["next"]), stmt, count=1, flags=re.I)
+            if n:
+                stmt = new
+                done.append(f"{it['table'].split('.')[-1]}.{it['column']} from {it['next']}")
+                break
+    return stmt
+
+
 def first_line(err: Exception) -> str:
     """Short error text. Snowflake puts the real reason on the line AFTER 'SQL compilation error:',
     so the first few lines are joined instead of keeping only the first."""
@@ -105,6 +129,26 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
     def close(self):
         if getattr(self, "conn", None):
             self.conn.close()
+
+    def explain(self, err: Exception) -> str:
+        low = str(err).lower()
+        which = "old" if self.side == "SRC" else "new"
+        if "incorrect username or password" in low:
+            return (f"Wrong username or password for the {which} account. If unsure, an ACCOUNTADMIN can reset it in "
+                    "Snowsight: ALTER USER <name> SET PASSWORD = '...';")
+        if ("250001" in low and "404" in low) or "could not connect to snowflake backend" in low or "account" in low and "not found" in low:
+            return (f"The {which} account identifier isn't right. In Snowsight run "
+                    "SELECT CURRENT_ORGANIZATION_NAME()||'-'||CURRENT_ACCOUNT_NAME(); and paste the result "
+                    "(looks like ABCDEFG-XY12345, not the short locator).")
+        if "mfa" in low or "multi-factor" in low or "duo" in low:
+            return f"The {which} account requires MFA: set Login type to 'username_password_mfa' and approve on your phone."
+        if "is not allowed to access snowflake" in low or "network policy" in low:
+            return f"The {which} account's network policy blocks this computer's IP address. Ask an admin to allow it."
+        if "warehouse" in low and ("does not exist" in low or "not authorized" in low):
+            return f"That warehouse doesn't exist in the {which} account (or the role can't use it). Run SHOW WAREHOUSES; and use one of them."
+        if "role" in low and ("does not exist" in low or "not authorized" in low or "is not assigned" in low):
+            return f"The role isn't available to this user in the {which} account. Use ACCOUNTADMIN, or a role granted to you."
+        return super().explain(err)
 
     def q(self, sql: str) -> list[dict]:
         with self.conn.cursor(DictCursor) as cur:
@@ -239,11 +283,16 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
         (base / "grants.sql").write_text("\n".join(grants))
 
         # 3. storage integrations (saved as templates - they need the NEW cloud tenant/role)
-        integrations = []
+        integrations, other_integrations = [], []
         for i in self._integrations():
             n, typ = i["name"], (i.get("type") or "").upper()
             if typ != "EXTERNAL_STAGE":
-                R.append(Result("integration", n, MANUAL, f"{typ} integration holds credentials - recreate it by hand."))
+                try:
+                    ddl = self.scalar(f"SELECT GET_DDL('INTEGRATION', {lit(n)})")
+                except Exception:
+                    ddl = ""
+                other_integrations.append({"name": n, "type": typ, "ddl": ddl})
+                R.append(Result("integration", n, OK, f"{typ} integration saved - restore shows the statement to finish it"))
                 continue
             props = {p["property"]: p["property_value"] for p in self.q(f"DESC INTEGRATION {ident(n)}")}
             provider = (props.get("STORAGE_PROVIDER") or "").upper()
@@ -258,6 +307,7 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
             integrations.append({"name": n, "provider": provider, "sql": sql, "original": props})
             R.append(Result("integration", n, OK, f"{provider} storage integration captured as template"))
         (base / "integrations.json").write_text(json.dumps(integrations, indent=2))
+        (base / "other_integrations.json").write_text(json.dumps(other_integrations, indent=2))
 
         self.log("Saving database definitions ...")
         # 4. full DDL of each database
@@ -271,13 +321,37 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
             except Exception as e:
                 R.append(Result("database", db, FAILED, first_line(e)))
             if d["tasks"]:
-                R.append(Result("tasks", db, MANUAL,
-                                f"{len(d['tasks'])} task(s) will be created SUSPENDED - run ALTER TASK ... RESUME when ready."))
+                R.append(Result("tasks", db, OK,
+                                f"{len(d['tasks'])} task(s) saved - created switched off; restore gives the command to start them"))
 
         # 4b. everything else in the account: census, users, monitors, parameters, policies, tags, apps ...
         census = self._census(list(self.inv))
         R += self._backup_extras(base, census, "\n".join(all_ddl))
         R += self._backup_apps(base, census)
+
+        # 4b2. identity / autoincrement columns: remember the next value so new rows don't reuse old IDs
+        identity = []
+        for db in self.inv:
+            try:
+                cols = self.q(f"SELECT table_schema, table_name, column_name, identity_increment "
+                              f"FROM {ident(db)}.INFORMATION_SCHEMA.COLUMNS WHERE is_identity = 'YES'")
+            except Exception:
+                continue
+            for c in cols:
+                c = {k.lower(): v for k, v in c.items()}
+                tfq = fq(db, c["table_schema"], c["table_name"])
+                try:
+                    mx = self.scalar(f"SELECT MAX({ident(c['column_name'])}) FROM {tfq}")
+                except Exception:
+                    continue
+                if mx is not None:
+                    step = int(c.get("identity_increment") or 1)
+                    identity.append({"table": f"{db}.{c['table_schema']}.{c['table_name']}",
+                                     "column": c["column_name"], "next": int(mx) + step})
+        (base / "identity.json").write_text(json.dumps(identity, indent=2))
+        if identity:
+            R.append(Result("identity columns", f"{len(identity)} column(s)", OK,
+                            "next values saved - new rows in the new account won't reuse old IDs"))
 
         # 4c. streams: saved separately and created AFTER the data is loaded (see restore)
         streams = []
@@ -311,7 +385,7 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
                 entry = {"fq": name, "type": typ, "sql": sql + ";"}
                 if typ.startswith("EXTERNAL") and str(s.get("has_credentials", "")).upper() in ("Y", "TRUE"):
                     entry["needs_credentials"] = True
-                    R.append(Result("stage", name, MANUAL, "uses a SAS token/keys - recreate with CREDENTIALS=(...) "
+                    R.append(Result("stage", name, OK, "saved without its token/keys - restore gives the statement to add a fresh one "
                                                            "or switch it to a storage integration"))
                 elif typ.startswith("INTERNAL") and not self.skip_data:
                     rel = Path("stages") / safe_name(db) / safe_name(sch) / safe_name(sn)
@@ -531,10 +605,17 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
         pending: list[list] = []          # [kind, name, statement, error]
 
         skip_streams = (base / "streams.json").exists()
+        id_map: dict = {}
+        id_file = base / "identity.json"
+        for it in (json.loads(id_file.read_text()) if id_file.exists() else []):
+            id_map.setdefault(it["table"].replace('"', "").upper(), []).append(it)
+        id_done: list = []
 
         def run(sql: str, kind: str, name: str):
             for stmt, _ in split_statements(StringIO(self.apply_rewrites(sql)), remove_comments=True):
                 stmt = stmt.strip()
+                if id_map:
+                    stmt = continue_identity(stmt, id_map, id_done)
                 if skip_streams and re.match(r"(?is)^create\s+(or\s+replace\s+)?stream\b", stmt):
                     continue                    # streams are created after the data load (step 7b)
                 if stmt and stmt != ";":
@@ -556,16 +637,17 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
                 run(x["sql"], x["kind"], x["name"])
 
         # 2. storage integrations - filled in with the NEW tenant / role
+        seen_apps: dict = {}
         for i in json.loads(read("integrations.json") or "[]"):
             sql = i["sql"]
             sql = sql.replace("{{AZURE_TENANT_ID}}", self.env("AZURE_TENANT_ID") or i["original"].get("AZURE_TENANT_ID", ""))
             sql = sql.replace("{{AWS_ROLE_ARN}}", self.env("AWS_ROLE_ARN") or i["original"].get("STORAGE_AWS_ROLE_ARN", ""))
             run(sql, "integration", i["name"])
-            hint = ("run DESC INTEGRATION in the new account, open AZURE_CONSENT_URL, then give the Snowflake app "
-                    "'Storage Blob Data Contributor' on the new storage account"
-                    if i["provider"] == "AZURE" else
-                    "update the IAM role trust policy with the new STORAGE_AWS_IAM_USER_ARN and EXTERNAL_ID")
-            R.append(Result("integration", i["name"], MANUAL, f"created - now {hint}."))
+            users_of = [x["fq"] for x in json.loads(read("stages.json") or "[]")
+                        if f'STORAGE_INTEGRATION={ident(i["name"])}' in x["sql"]]
+            test = "\n".join(f"LIST @{u};" for u in users_of) or f"DESC INTEGRATION {ident(i['name'])};"
+            R.append(Result("integration", i["name"], MANUAL, self._integration_todo(i, seen_apps),
+                            "-- after approving, test that Snowflake can read the files:\n" + test))
 
         self.log("Creating databases and objects ...")
         # 3. databases (schemas, tables, views, procedures, tasks, ...)
@@ -597,6 +679,9 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
             if len(pending) == len(todo):
                 break
 
+        if id_done:
+            R.append(Result("identity columns", f"{len(id_done)} column(s)", OK,
+                            "counters continue after the old highest ID: " + ", ".join(id_done[:6])))
         for f in db_files:
             n = sum(1 for p in pending if p[0] == "database" and p[1] == f.stem)
             R.append(Result("database", f.stem, OK if n == 0 else FAILED,
@@ -653,6 +738,9 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
         R += self._restore_apps(base)
         R += self._restore_workspaces(base)
 
+        # 8b. everything the person must finish by hand, with exact commands for this account
+        R += self._restore_followups(base)
+
         # 9. grants last (objects must exist first)
         grant_fail = []
         for stmt, _ in split_statements(StringIO(read("grants.sql")), remove_comments=True):
@@ -670,7 +758,10 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
                     grant_fail.append(f"{stmt[:110]} ({first_line(e)[:200]})")
         if grant_fail:
             for g in grant_fail[:30]:
-                R.append(Result("grant", g.split(" (")[0][:120], MANUAL, "refused: " + g[len(g.split(" (")[0]):].strip(" ()")[:200]))
+                stmt_txt = g.split(" (")[0]
+                R.append(Result("grant", stmt_txt[:120], MANUAL,
+                                "refused: " + g[len(stmt_txt):].strip(" ()")[:200] + ". Fix the cause, then run:",
+                                stmt_txt.rstrip(";") + ";"))
             if len(grant_fail) > 30:
                 R.append(Result("grants", f"{len(grant_fail) - 30} more", MANUAL, "see report_restore.json for all"))
         elif read("grants.sql").strip():
@@ -717,6 +808,36 @@ class SnowflakeConnector(SnowflakeExtrasMixin, Connector):
                                 f"auto-upload failed ({first_line(e)[:90]}). In Snowsight > Projects > Workspaces "
                                 f"use '+ > Upload Folder' and pick {local_root}"))
         return R
+
+    def _integration_todo(self, i: dict, seen_apps: dict) -> str:
+        """Exact, account-specific approval steps for one storage integration, read from the NEW account."""
+        name, provider = i["name"], i["provider"]
+        try:
+            props = {p["property"]: p["property_value"] for p in self.q(f"DESC INTEGRATION {ident(name)}")}
+        except Exception:
+            props = {}
+        locs = [x.strip() for x in (props.get("STORAGE_ALLOWED_LOCATIONS") or "").split(",") if x.strip()]
+        if provider == "AZURE" and props.get("AZURE_CONSENT_URL"):
+            app = (props.get("AZURE_MULTI_TENANT_APP_NAME") or "").split("_")[0]
+            accounts = sorted({re.sub(r"^azure://([^.]+)\..*$", r"\1", l) for l in locs if l.startswith("azure://")})
+            where = ", ".join(accounts) or "your storage account"
+            if app and app in seen_apps:
+                return (f"Uses the same Snowflake app as {seen_apps[app]} (already approved there). "
+                        f"Just make sure app '{app}' has the role 'Storage Blob Data Contributor' on: {where}.")
+            seen_apps[app] = name
+            return ("Approve once: open " + props["AZURE_CONSENT_URL"] + " and click Accept. "
+                    f"Then in the Azure Portal open storage account(s) {where} -> Access Control (IAM) -> "
+                    f"Add role assignment -> 'Storage Blob Data Contributor' -> select app '{app}' -> Assign. "
+                    "Wait 1-2 minutes, then test with LIST @<your stage>.")
+        if provider == "S3" and props.get("STORAGE_AWS_IAM_USER_ARN"):
+            return ("In AWS IAM open role " + (props.get("STORAGE_AWS_ROLE_ARN") or "") + " -> Trust relationships -> "
+                    "set Principal AWS to " + props["STORAGE_AWS_IAM_USER_ARN"] +
+                    " and sts:ExternalId to " + (props.get("STORAGE_AWS_EXTERNAL_ID") or "") + ".")
+        if provider == "GCS" and props.get("STORAGE_GCP_SERVICE_ACCOUNT"):
+            return ("In Google Cloud, give service account " + props["STORAGE_GCP_SERVICE_ACCOUNT"] +
+                    " the role 'Storage Object Admin' on bucket(s): " + (", ".join(locs) or "your buckets") + ".")
+        return ("created - run DESC INTEGRATION " + name + " in the new account and follow its consent / "
+                "permission values so Snowflake can read your cloud storage.")
 
     def _restore_streams(self, base: Path) -> list[Result]:
         f = base / "streams.json"
